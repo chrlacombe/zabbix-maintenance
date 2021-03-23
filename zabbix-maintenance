@@ -1,0 +1,267 @@
+#!/usr/bin/php
+<?php
+
+/*
+ *
+ * (c) C. Lacombe
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+##################################################
+#
+# CLASSES
+#
+##################################################
+class jsonrpc
+{
+    protected function connect($server, $query)
+    {
+		global $verbose;
+
+        $http = curl_init($server);
+        curl_setopt($http, CURLOPT_CUSTOMREQUEST, 'POST');
+        curl_setopt($http, CURLOPT_POSTFIELDS, $query);
+        curl_setopt($http, CURLOPT_RETURNTRANSFER, TRUE);
+        curl_setopt($http, CURLOPT_SSL_VERIFYPEER, FALSE);
+        curl_setopt($http, CURLOPT_SSL_VERIFYHOST, FALSE);
+        curl_setopt($http, CURLOPT_HTTPHEADER, array('Content-Type: application/json') );
+
+        $response = curl_exec($http);
+        curl_close($http);
+
+		if ( $verbose ) {
+			echo $query."\n";
+			echo $response."\n";
+		}
+
+        return json_decode($response, true);
+    }
+}
+
+class zbxapi extends jsonrpc
+{
+    public $access_token;
+    public $url;
+	
+	function __construct( $url, $user, $password ) 
+    { 
+        $this->url 			= $url;
+		$params['user']	 	= $user;
+		$params['password'] = $password;
+
+		$data = $this->call( 'user.login', $params );
+		if ( isset( $data['result'] ) ) {
+			$this->access_token = $data['result'];
+		}
+    } 
+	
+    function call( $method, $params )
+    {
+        $data['jsonrpc']        = '2.0';
+        $data['method']         = $method;
+        $data['params']         = $params;
+
+        if(!empty($this->access_token)) $data['auth'] = $this->access_token;
+        $data['id'] = rand(1,100);
+        
+		$data = json_encode($data);
+        
+        return $this->connect($this->url, $data);
+    }
+}
+
+##################################################
+#
+# CONFIG
+#
+##################################################
+define("ZABBIX_URL", "https://localhost/api_jsonrpc.php");
+define("ZABBIX_USER", "");
+define("ZABBIX_PASSWORD", "");
+
+##################################################
+#
+# OPTIONS
+#
+##################################################
+$longopts  = array(
+	"host:",
+	"group:",   
+	"template:",
+	"application:",
+    "status:",   
+    "description:",   
+	"hosttags:", 
+	"triggertags:", 
+	"exclude"
+);
+
+##################################################
+#
+# VARIABLES
+#
+##################################################
+$options 	 	= getopt("",$longopts);
+$zbx 		 	= new zbxapi( ZABBIX_URL, ZABBIX_USER, ZABBIX_PASSWORD );
+$host 		 	= isset( $options["host"] ) ? $options["host"] : false;
+$group	 	 	= isset( $options["group"] ) ? $options["group"] : false;
+$template 	 	= isset( $options["template"] ) ? $options["template"] : false;
+$application	= isset( $options["application"] ) ? $options["application"] : false;
+$status 	 	= isset( $options["status"] ) ? $options["status"] : 0;
+$description 	= isset( $options["description"] ) ? $options["description"] : false;
+$hosttags 		= isset( $options["hosttags"] ) ? $options["hosttags"] : false;
+$triggertags 	= isset( $options["triggertags"] ) ? $options["triggertags"] : false;
+$exclude	 	= isset( $options["exclude"] ) ? true : false;
+
+##################################################
+#
+# Main
+#
+##################################################
+
+### Get Proxy
+$datas = $zbx->call( 'proxy.get', array( 
+	"output" => array("proxyid","host"),
+	"preservekeys" => true
+));
+$proxies = $datas["result"];
+
+### Get Hosts
+$params = array( 
+	"output" => array("hostid","host","proxy_hostid")
+);
+
+if ( $group ) 
+{
+	$datas = $zbx->call( 'hostgroup.get', array( 
+		"output" => array("groupid"),
+		"filter" => array( 
+			"name" => array($group) 
+		) 
+	));
+	$hostgroups = $datas["result"];
+
+	if( count($hostgroups) == 0 ) {
+		exit(0);
+	}
+
+	$groupids = array();
+	foreach( $hostgroups as $hostgroup ) {
+		$groupids[] = $hostgroup["groupid"];
+	}
+	$params["groupids"] = $groupids;
+}
+
+if ( $host ) {
+	$params["filter"] = array( 
+		"host" => array($host) 
+	);
+}
+
+if ( $hosttags ) {
+	$elements = preg_split("/,/", $hosttags);
+	foreach( $elements as $element ) {
+		$object = (object)array(
+			"operator" => 1
+		);
+		$keywords = preg_split("/:/", $hosttags);
+		if ( isset( $keywords[0] ) ){
+			$object->tag = $keywords[0];
+		}
+		if ( isset( $keywords[1] ) ){
+			$object->value = $keywords[1];
+		}
+		$params["tags"][] = $object;
+	}
+	
+}
+
+$datas = $zbx->call( 'host.get', $params );
+$hosts = $datas["result"];	
+
+if( count($hosts) == 0 ) {
+	echo "No such Host";
+	exit(1);
+}
+
+if ( $application ) 
+{
+	$elements = preg_split("/,/", $application);
+	$params = array( 
+		"output" => array("applicationid"),
+		"filter" => array( 
+			"name" => $elements
+		) 
+	);
+
+	$datas = $zbx->call( 'application.get', $params );
+	$applications = $datas["result"];
+
+	if( count($applications) == 0 ) {
+		exit(0);
+	}
+}
+
+if (!$host && !$group && !$template && !$application) {
+	echo "No Host or Group\n";
+	exit(1);
+}
+
+### Get Triggers
+$params = array( 
+	"output" => ["triggerid"],
+	"excludeSearch" => $exclude
+);
+
+if ( $application ) {
+	foreach( $applications as $data ) {
+		$params["applicationids"][] = $data["applicationid"];
+	}
+}
+
+if ( $description ) {
+	$params["search"] = array( 
+		"description" => array($description) 
+	);
+}
+
+if ( $triggertags ) {
+	$elements = preg_split("/,/", $triggertags);
+	foreach( $elements as $element ) {
+		$object = (object)array(
+			"operator" => 1
+		);
+		$keywords = preg_split("/:/", $triggertags);
+		if ( isset( $keywords[0] ) ){
+			$object->tag = $keywords[0];
+		}
+		if ( isset( $keywords[1] ) ){
+			$object->value = $keywords[1];
+		}
+		$params["tags"][] = $object;
+	}
+	
+}
+
+$datas = $zbx->call( 'trigger.get', $params );
+$triggers = $datas["result"];
+
+if( count($triggers) == 0 ) {
+	exit(0);
+}
+
+### Update Triggers
+$params = array();
+
+foreach( $triggers as $trigger ) {
+	$params[] = array(
+		"triggerid" => $trigger['triggerid'],
+		"status" => $status
+	);
+}
+
+$zbx->call( 'trigger.update', $params );
+
+echo "Change OK";
